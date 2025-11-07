@@ -74,7 +74,7 @@ class CellDetectionNetwork(nn.Module):
         # If you have many layers, use nn.Sequential() to simplify your code         #
         ##############################################################################
         
-        # Improved encoder-decoder architecture with batch normalization and dropout
+        # Encoder-decoder architecture with batch normalization (matches trained checkpoint)
         # Encoder: downsampling path with batch normalization
         self.enc1 = nn.Sequential(
             nn.Conv2d(1, 32, 3, padding=1),
@@ -96,7 +96,7 @@ class CellDetectionNetwork(nn.Module):
         )
         self.pool2 = nn.MaxPool2d(2, stride=2)
         
-        # Bottleneck with more capacity
+        # Bottleneck
         self.bottleneck = nn.Sequential(
             nn.Conv2d(64, 128, 3, padding=1),
             nn.BatchNorm2d(128),
@@ -106,7 +106,7 @@ class CellDetectionNetwork(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Decoder: upsampling path with dropout to prevent overfitting
+        # Decoder: upsampling path with dropout (matches trained checkpoint)
         self.up1 = nn.ConvTranspose2d(128, 64, 2, stride=2)
         self.dec1 = nn.Sequential(
             nn.Conv2d(128, 64, 3, padding=1),  # 64 from skip + 64 from up
@@ -224,8 +224,8 @@ def generate_pseudo_labels(cell_images_path, output_path, min_sigma=0.5, max_sig
     - threshold=0.05: Lower threshold to keep more detections
     - k_xy=3: Smaller neighborhood for maxima detection (better than k_xy=5)
     - intensity_percentile=45: Keep top 55% brightest regions (slightly lower to catch more cells)
-    - Fixed radius=6px: Small radius with non-maximum suppression to create distinct blobs
-    - Non-maximum suppression: Prevents nearby maxima (<10px) from creating overlapping blobs
+    - Fixed radius=4px: Very small radius (8px diameter) to match individual cell sizes
+    - Non-maximum suppression: Prevents nearby maxima (<8px) from creating overlapping blobs
     
     Args:
         cell_images_path: Path to directory containing cell images
@@ -294,7 +294,7 @@ def generate_pseudo_labels(cell_images_path, output_path, min_sigma=0.5, max_sig
         
         # Apply non-maximum suppression: if two maxima are too close, keep only the brighter one
         # This prevents creating overlapping blobs from nearby detections
-        min_distance = 10  # Minimum distance between blob centers (2 * radius)
+        min_distance = 8  # Minimum distance between blob centers (2 * radius for 4px radius)
         suppressed_maxima = []
         for i, (y1, x1, s1) in enumerate(filtered_maxima):
             keep = True
@@ -313,9 +313,10 @@ def generate_pseudo_labels(cell_images_path, output_path, min_sigma=0.5, max_sig
             if keep:
                 suppressed_maxima.append((y1, x1, s1))
         
-        # Use smaller radius to prevent blob merging and reduce false coverage
-        # Smaller radius (6px) creates more distinct blobs that better match individual cells
-        radius = 6  # Reduced to 6px to create more distinct, non-overlapping blobs
+        # Use very small radius to match individual cell sizes
+        # Small radius (4px = 8px diameter) better matches actual cell dot sizes
+        # This prevents one blob from covering multiple cells
+        radius = 4  # Very small radius to match individual cell sizes
         
         for y, x, s in suppressed_maxima:
                 
@@ -579,12 +580,8 @@ def evaluate_only(model_path, valloader, val_folder, save_dir='pred'):
     model = CellDetectionNetwork().to(device)
     checkpoint = torch.load(model_path, map_location=device)
     
-    # Try to load state dict - if it fails due to architecture mismatch, load with strict=False
-    try:
-        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
-    except RuntimeError:
-        print("Warning: Model architecture mismatch. Loading with strict=False (some layers may not load).")
-        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    # Load model checkpoint
+    model.load_state_dict(checkpoint['model_state_dict'])
     
     model.eval()
     
@@ -648,12 +645,8 @@ def evaluate_only(model_path, valloader, val_folder, save_dir='pred'):
                 
                 binary_map = (pred_map > threshold).astype(np.uint8)
                 
-                # Post-processing: morphological operations to clean up the binary map
-                from scipy.ndimage import binary_opening, binary_closing
-                # Opening: removes small noise (erosion followed by dilation)
-                binary_map = binary_opening(binary_map, structure=np.ones((2, 2))).astype(np.uint8)
-                # Closing: fills small holes (dilation followed by erosion)
-                binary_map = binary_closing(binary_map, structure=np.ones((2, 2))).astype(np.uint8)
+                # Post-processing: light morphological operations (removed - was too aggressive)
+                # The model outputs are already sparse, so morphological ops remove too much
                 
                 # Find cell centers using connected components
                 labeled, num_features = label(binary_map)
