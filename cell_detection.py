@@ -79,9 +79,9 @@ def gaussian_filter_gpu(image_tensor, sigma, device='cpu'):
     G = G / G.sum()
     G = G.view(1, 1, kernel_size, kernel_size)
     
-    # Apply convolution with reflection padding
-    padding = r
-    output = F.conv2d(image_tensor, G, padding=padding, padding_mode='reflect')
+    # Apply reflection padding first, then convolution with valid padding
+    padded = F.pad(image_tensor, (r, r, r, r), mode='reflect')
+    output = F.conv2d(padded, G, padding=0)
     return output
 
 def find_maxima_modified_gpu(scale_space_tensor, k_xy=5, k_s=1):
