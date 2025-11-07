@@ -402,8 +402,8 @@ def generate_pseudo_labels(cell_images_path, output_path, min_sigma=0.5, max_sig
         pseudo_label = np.zeros((H, W), dtype=np.float32)
         
         # Filter maxima by intensity - only keep bright regions (assuming cells are bright)
-        # Use 45th percentile (slightly lower than 50th to catch more cells while still filtering noise)
-        intensity_threshold = np.percentile(cell_img, 45)  # Keep top 55% brightest regions
+        # Use 50th percentile (more conservative to reduce false positives in pseudo-labels)
+        intensity_threshold = np.percentile(cell_img, 50)  # Keep top 50% brightest regions (increased from 45)
         
         # Filter maxima by intensity first
         filtered_maxima = []
@@ -415,7 +415,7 @@ def generate_pseudo_labels(cell_images_path, output_path, min_sigma=0.5, max_sig
         
         # Apply non-maximum suppression: if two maxima are too close, keep only the brighter one
         # This prevents creating overlapping blobs from nearby detections
-        min_distance = 8  # Minimum distance between blob centers (2 * radius for 4px radius)
+        min_distance = 10  # Minimum distance between blob centers (increased from 8 to reduce false positives)
         suppressed_maxima = []
         for i, (y1, x1, s1) in enumerate(filtered_maxima):
             keep = True
@@ -596,8 +596,8 @@ def train(model, trainloader, valloader, num_epoch=20):
     # Define loss function (Binary Cross Entropy for pixel-level classification)
     criterion = nn.BCELoss()
     
-    # Define optimizer with slightly higher learning rate for better convergence
-    optimizer = optim.Adam(model.parameters(), lr=2e-3)
+    # Define optimizer with weight decay for regularization (reduces overfitting)
+    optimizer = optim.Adam(model.parameters(), lr=2e-3, weight_decay=1e-4)
     
     # Learning rate scheduler: reduce LR by 0.5 every 7 epochs
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.5)
@@ -742,21 +742,21 @@ def evaluate_only(model_path, valloader, val_folder, save_dir='pred'):
                     # Model outputs are low or sparse - use adaptive thresholding
                     above_mean = pred_map[pred_map > pred_map.mean()]
                     if len(above_mean) > 100:  # Enough pixels to use percentile
-                        # Use 85th percentile (higher than 70th to reduce FP) of values above mean
-                        threshold = np.percentile(above_mean, 85)
+                        # Use 90th percentile (more aggressive to reduce FP) of values above mean
+                        threshold = np.percentile(above_mean, 90)
                         # Cap threshold based on max value
                         if pred_map.max() < 0.3:
-                            threshold = min(threshold, pred_map.max() * 0.8)  # 80% of max
+                            threshold = min(threshold, pred_map.max() * 0.85)  # 85% of max
                         else:
-                            threshold = min(threshold, 0.4)  # Cap at 0.4 (higher than 0.3)
+                            threshold = min(threshold, 0.45)  # Cap at 0.45 (higher than 0.4)
                     else:
                         # Not enough pixels, use a fixed threshold
-                        threshold = 0.3  # Increased from 0.2
+                        threshold = 0.35  # Increased from 0.3
                     
                     # Ensure minimum threshold
-                    threshold = max(threshold, pred_map.mean() + 0.05)  # At least mean + 0.05 (increased from 0.02)
-                elif pct_above_05 < 0.05:  # Less than 5% above 0.5, use 0.4 threshold
-                    threshold = 0.4  # Increased from 0.3
+                    threshold = max(threshold, pred_map.mean() + 0.08)  # At least mean + 0.08 (increased from 0.05)
+                elif pct_above_05 < 0.05:  # Less than 5% above 0.5, use 0.45 threshold
+                    threshold = 0.45  # Increased from 0.4
                 else:
                     # Model outputs are good - use standard threshold
                     threshold = 0.5
@@ -766,18 +766,20 @@ def evaluate_only(model_path, valloader, val_folder, save_dir='pred'):
                 
                 binary_map = (pred_map > threshold).astype(np.uint8)
                 
-                # Post-processing: light morphological opening to remove small noise
-                from scipy.ndimage import binary_opening
-                # Use small kernel (3x3) to remove tiny noise without affecting real cells
+                # Post-processing: morphological opening to remove small noise
+                from scipy.ndimage import binary_opening, binary_closing
+                # Use 3x3 kernel for opening to remove tiny noise
                 kernel = np.ones((3, 3), dtype=np.uint8)
                 binary_map = binary_opening(binary_map, structure=kernel).astype(np.uint8)
+                # Light closing to smooth boundaries (optional, helps with fragmented detections)
+                binary_map = binary_closing(binary_map, structure=kernel).astype(np.uint8)
                 
                 # Find cell centers using connected components
                 labeled, num_features = label(binary_map)
                 
                 if num_features > 0:
                     # Filter out very small components (likely noise)
-                    min_component_size = 5  # Increased from 3 to 5 to filter noise
+                    min_component_size = 7  # Increased from 5 to 7 to filter more noise
                     coordinates = []
                     confidences = []  # Store confidence values for NMS
                     
@@ -793,15 +795,15 @@ def evaluate_only(model_path, valloader, val_folder, save_dir='pred'):
                             y, x = max_idx
                             confidence = component_pred[y, x]
                             
-                            # Only keep if confidence is above a minimum threshold
-                            if confidence > 0.3 and not (np.isnan(x) or np.isnan(y)):
+                            # Only keep if confidence is above a higher minimum threshold
+                            if confidence > 0.4 and not (np.isnan(x) or np.isnan(y)):  # Increased from 0.3 to 0.4
                                 coordinates.append((int(round(x)), int(round(y))))
                                 confidences.append(confidence)
                     
                     # Non-maximum suppression: remove detections that are too close
                     # Keep only the detection with highest confidence if within min_distance
                     if len(coordinates) > 1:
-                        min_distance = 12  # Minimum distance between detections (increased from 8)
+                        min_distance = 15  # Minimum distance between detections (increased from 12 to 15)
                         suppressed_coords = []
                         suppressed_confs = []
                         
