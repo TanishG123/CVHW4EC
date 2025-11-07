@@ -1,11 +1,11 @@
 === Cell Detection Evaluation Results ===
 Threshold distance: 15.0 pixels
 --------------------------------------------------
-TP: 2421
-FP: 1072
-FN: 1175
-Precision: 0.6931
-Recall: 0.6732
-F1: 0.6830
+TP: 2487
+FP: 1123
+FN: 1109
+Precision: 0.6889
+Recall: 0.6916
+F1: 0.6903
 Total_GT_Cells: 3596
-Total_Pred_Cells: 3493
+Total_Pred_Cells: 3610

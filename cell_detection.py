@@ -1052,7 +1052,7 @@ def main():
     
     if args.training:
         model = CellDetectionNetwork().to(device)
-        train(model, trainloader, valloader, num_epoch=20)
+        train(model, trainloader, valloader, num_epoch=30)
         
     # Run model evaluation and save predictions
     print("\nRunning model evaluation...")
