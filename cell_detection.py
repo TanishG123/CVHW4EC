@@ -730,56 +730,52 @@ def evaluate_only(model_path, valloader, val_folder, save_dir='pred'):
                     print(f"  Min: {pred_map.min():.4f}, Max: {pred_map.max():.4f}, Mean: {pred_map.mean():.4f}")
                     print(f"  Pixels > 0.5: {np.sum(pred_map > 0.5)}, Pixels > 0.3: {np.sum(pred_map > 0.3)}, Pixels > 0.1: {np.sum(pred_map > 0.1)}")
                 
-                # Improved adaptive thresholding: balance precision and recall
-                # Strategy: Use higher thresholds to reduce false positives while maintaining recall
+                # Balanced adaptive thresholding: optimize for F1 score
+                # Strategy: Model outputs are good (max ~0.99, 17% > 0.5), use moderate thresholds
                 
-                # Check how many pixels are above 0.5 - if very few, use lower threshold
+                # Check how many pixels are above 0.5 - model has good coverage
                 pixels_above_05 = np.sum(pred_map > 0.5)
                 total_pixels = pred_map.size
                 pct_above_05 = pixels_above_05 / total_pixels
                 
-                if pred_map.max() < 0.5 or pct_above_05 < 0.01:  # Less than 1% above 0.5
-                    # Model outputs are low or sparse - use adaptive thresholding
+                if pred_map.max() < 0.3 or pct_above_05 < 0.005:  # Very low outputs
+                    # Model outputs are very low - use adaptive thresholding
                     above_mean = pred_map[pred_map > pred_map.mean()]
-                    if len(above_mean) > 100:  # Enough pixels to use percentile
-                        # Use 90th percentile (more aggressive to reduce FP) of values above mean
-                        threshold = np.percentile(above_mean, 90)
-                        # Cap threshold based on max value
-                        if pred_map.max() < 0.3:
-                            threshold = min(threshold, pred_map.max() * 0.85)  # 85% of max
-                        else:
-                            threshold = min(threshold, 0.45)  # Cap at 0.45 (higher than 0.4)
+                    if len(above_mean) > 100:
+                        # Use 75th percentile (balanced) of values above mean
+                        threshold = np.percentile(above_mean, 75)
+                        threshold = min(threshold, 0.35)  # Cap at 0.35
                     else:
-                        # Not enough pixels, use a fixed threshold
-                        threshold = 0.35  # Increased from 0.3
-                    
-                    # Ensure minimum threshold
-                    threshold = max(threshold, pred_map.mean() + 0.08)  # At least mean + 0.08 (increased from 0.05)
-                elif pct_above_05 < 0.05:  # Less than 5% above 0.5, use 0.45 threshold
-                    threshold = 0.45  # Increased from 0.4
+                        threshold = 0.25
+                    threshold = max(threshold, pred_map.mean() + 0.03)
+                elif pct_above_05 < 0.10:  # Less than 10% above 0.5
+                    # Use moderate threshold - model has decent outputs
+                    threshold = 0.38
+                elif pct_above_05 < 0.20:  # 10-20% above 0.5 (typical case)
+                    # Model has good outputs - use standard threshold
+                    threshold = 0.42
                 else:
-                    # Model outputs are good - use standard threshold
-                    threshold = 0.5
+                    # Model has very high outputs - use higher threshold
+                    threshold = 0.48
                 
                 if batch_idx == 0 and i == 0:
                     print(f"  Using improved adaptive threshold: {threshold:.4f}")
                 
                 binary_map = (pred_map > threshold).astype(np.uint8)
                 
-                # Post-processing: morphological opening to remove small noise
-                from scipy.ndimage import binary_opening, binary_closing
-                # Use 3x3 kernel for opening to remove tiny noise
+                # Post-processing: light morphological opening to remove tiny noise
+                from scipy.ndimage import binary_opening
+                # Use small 3x3 kernel - only remove very small noise
                 kernel = np.ones((3, 3), dtype=np.uint8)
                 binary_map = binary_opening(binary_map, structure=kernel).astype(np.uint8)
-                # Light closing to smooth boundaries (optional, helps with fragmented detections)
-                binary_map = binary_closing(binary_map, structure=kernel).astype(np.uint8)
+                # Don't use closing - it can merge separate cells
                 
                 # Find cell centers using connected components
                 labeled, num_features = label(binary_map)
                 
                 if num_features > 0:
                     # Filter out very small components (likely noise)
-                    min_component_size = 7  # Increased from 5 to 7 to filter more noise
+                    min_component_size = 4  # Balanced: catch small cells but filter tiny noise
                     coordinates = []
                     confidences = []  # Store confidence values for NMS
                     
@@ -795,15 +791,15 @@ def evaluate_only(model_path, valloader, val_folder, save_dir='pred'):
                             y, x = max_idx
                             confidence = component_pred[y, x]
                             
-                            # Only keep if confidence is above a higher minimum threshold
-                            if confidence > 0.4 and not (np.isnan(x) or np.isnan(y)):  # Increased from 0.3 to 0.4
+                            # Only keep if confidence is above threshold (balanced for F1)
+                            if confidence > 0.35 and not (np.isnan(x) or np.isnan(y)):  # Balanced: 0.35
                                 coordinates.append((int(round(x)), int(round(y))))
                                 confidences.append(confidence)
                     
                     # Non-maximum suppression: remove detections that are too close
                     # Keep only the detection with highest confidence if within min_distance
                     if len(coordinates) > 1:
-                        min_distance = 15  # Minimum distance between detections (increased from 12 to 15)
+                        min_distance = 12  # Balanced: 12px allows close cells but prevents duplicates
                         suppressed_coords = []
                         suppressed_confs = []
                         
