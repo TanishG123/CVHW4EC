@@ -51,90 +51,6 @@ from torchsummary import summary
 from blob_detection import gaussian_filter, find_maxima_modified
 from common import read_img, visualize_maxima, save_img
 
-# GPU-optimized blob detection functions
-def gaussian_filter_gpu(image_tensor, sigma, device='cpu'):
-    """
-    GPU-optimized Gaussian filter using PyTorch
-    
-    Args:
-        image_tensor: PyTorch tensor of shape (1, 1, H, W)
-        sigma: scalar standard deviation
-        device: 'cuda' or 'cpu'
-    
-    Returns:
-        Filtered image tensor of shape (1, 1, H, W)
-    """
-    H, W = image_tensor.shape[2], image_tensor.shape[3]
-    kernel_size = int(2 * np.ceil(2 * sigma) + 1)
-    kernel_size = min(kernel_size, min(H, W) // 2)
-    if kernel_size % 2 == 0:
-        kernel_size = kernel_size + 1
-    
-    r = (kernel_size - 1) // 2
-    ax = torch.arange(-r, r + 1, dtype=torch.float32, device=device)
-    X, Y = torch.meshgrid(ax, ax, indexing='ij')
-    
-    # 2D Gaussian kernel
-    G = torch.exp(-(X**2 + Y**2) / (2.0 * sigma**2))
-    G = G / G.sum()
-    G = G.view(1, 1, kernel_size, kernel_size)
-    
-    # Apply reflection padding first, then convolution with valid padding
-    padded = F.pad(image_tensor, (r, r, r, r), mode='reflect')
-    output = F.conv2d(padded, G, padding=0)
-    return output
-
-def find_maxima_modified_gpu(scale_space_tensor, k_xy=5, k_s=1):
-    """
-    GPU-optimized maxima finding using PyTorch
-    Matches the logic of find_maxima_modified but uses GPU operations
-    
-    Args:
-        scale_space_tensor: PyTorch tensor of shape (H, W, S)
-        k_xy: neighborhood in x and y
-        k_s: neighborhood in scale
-    
-    Returns:
-        list of (y, x, s) tuples
-    """
-    H, W, S = scale_space_tensor.shape
-    maxima = []
-    
-    # Reshape to (1, S, H, W) for easier processing
-    scale_space_4d = scale_space_tensor.permute(2, 0, 1).unsqueeze(0)  # (1, S, H, W)
-    
-    kernel_size = 2 * k_xy + 1
-    
-    for s in range(S):
-        # Get single scale: (1, 1, H, W)
-        scale_slice = scale_space_4d[:, s:s+1, :, :]
-        
-        # Use max pooling to find local maxima in spatial neighborhood
-        # This finds the max value in (2k_xy+1) x (2k_xy+1) neighborhood
-        max_pooled = F.max_pool2d(scale_slice, kernel_size=kernel_size, stride=1, padding=k_xy)
-        
-        # A pixel is a local maximum if it equals the max in its neighborhood
-        # AND we need to check scale dimension too
-        is_spatial_max = (scale_slice == max_pooled) & (scale_slice > 0)
-        
-        # Get coordinates of spatial maxima
-        y_coords, x_coords = torch.where(is_spatial_max[0, 0])
-        
-        for y_idx, x_idx in zip(y_coords.cpu().numpy(), x_coords.cpu().numpy()):
-            y, x = int(y_idx), int(x_idx)
-            
-            # Check scale dimension: must be max in scale neighborhood too
-            s_min = max(0, s - k_s)
-            s_max = min(S, s + k_s + 1)
-            scale_neighbors = scale_space_tensor[y, x, s_min:s_max]
-            mid_value = scale_space_tensor[y, x, s]
-            
-            # Check if mid_value is max among scale neighbors
-            if torch.all(mid_value >= scale_neighbors) and mid_value > 0:
-                maxima.append((y, x, s))
-    
-    return maxima
-
 if torch.cuda.is_available():
     print("Using the GPU. You are good to go!")
     device = 'cuda'
@@ -158,8 +74,8 @@ class CellDetectionNetwork(nn.Module):
         # If you have many layers, use nn.Sequential() to simplify your code         #
         ##############################################################################
         
-        # Encoder-decoder architecture with batch normalization (matches trained checkpoint)
-        # Encoder: downsampling path with batch normalization
+        # Encoder-decoder architecture
+        # Encoder: downsampling with batch normalization
         self.enc1 = nn.Sequential(
             nn.Conv2d(1, 32, 3, padding=1),
             nn.BatchNorm2d(32),
@@ -190,10 +106,10 @@ class CellDetectionNetwork(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Decoder: upsampling path with dropout (matches trained checkpoint)
+        # Decoder: upsampling with dropout
         self.up1 = nn.ConvTranspose2d(128, 64, 2, stride=2)
         self.dec1 = nn.Sequential(
-            nn.Conv2d(128, 64, 3, padding=1),  # 64 from skip + 64 from up
+            nn.Conv2d(128, 64, 3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Dropout2d(0.2),
@@ -204,7 +120,7 @@ class CellDetectionNetwork(nn.Module):
         
         self.up2 = nn.ConvTranspose2d(64, 32, 2, stride=2)
         self.dec2 = nn.Sequential(
-            nn.Conv2d(64, 32, 3, padding=1),  # 32 from skip + 32 from up
+            nn.Conv2d(64, 32, 3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
             nn.Dropout2d(0.2),
@@ -213,7 +129,7 @@ class CellDetectionNetwork(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Output layer - single channel with sigmoid for 0-1 probabilities
+        # Output layer
         self.output = nn.Conv2d(32, 1, 1)
     
     def forward(self, x):
@@ -223,33 +139,31 @@ class CellDetectionNetwork(nn.Module):
         # Output: should be of shape (batch_size, 1, H, W) with values 0-1          #
         ##############################################################################
         
-        # Encoder path
-        e1 = self.enc1(x)  # (batch, 32, H, W)
-        p1 = self.pool1(e1)  # (batch, 32, H/2, W/2)
+        # Encoder 
+        e1 = self.enc1(x) 
+        p1 = self.pool1(e1)
         
-        e2 = self.enc2(p1)  # (batch, 64, H/2, W/2)
-        p2 = self.pool2(e2)  # (batch, 64, H/4, W/4)
+        e2 = self.enc2(p1)
+        p2 = self.pool2(e2)
         
         # Bottleneck
-        b = self.bottleneck(p2)  # (batch, 128, H/4, W/4)
+        b = self.bottleneck(p2)
         
-        # Decoder path with skip connections
-        u1 = self.up1(b)  # (batch, 64, H/2, W/2)
-        # Handle potential size mismatch for skip connection
+        # Decoder with skip connections
+        u1 = self.up1(b)
         if u1.shape[2:] != e2.shape[2:]:
             u1 = F.interpolate(u1, size=e2.shape[2:], mode='bilinear', align_corners=False)
-        u1 = torch.cat([u1, e2], dim=1)  # Skip connection: (batch, 128, H/2, W/2)
-        d1 = self.dec1(u1)  # (batch, 64, H/2, W/2)
+        u1 = torch.cat([u1, e2], dim=1)
+        d1 = self.dec1(u1)
         
-        u2 = self.up2(d1)  # (batch, 32, H, W)
-        # Handle potential size mismatch for skip connection
+        u2 = self.up2(d1)
         if u2.shape[2:] != e1.shape[2:]:
             u2 = F.interpolate(u2, size=e1.shape[2:], mode='bilinear', align_corners=False)
-        u2 = torch.cat([u2, e1], dim=1)  # Skip connection: (batch, 64, H, W)
-        d2 = self.dec2(u2)  # (batch, 32, H, W)
+        u2 = torch.cat([u2, e1], dim=1)
+        d2 = self.dec2(u2)
         
-        # Output with sigmoid activation for 0-1 probabilities
-        out = torch.sigmoid(self.output(d2))  # (batch, 1, H, W)
+        # Output
+        out = torch.sigmoid(self.output(d2))
         
         return out
 
@@ -301,38 +215,11 @@ def load_and_save_ground_truth(val_folder, save_dir="gt"):
 def generate_pseudo_labels(cell_images_path, output_path, min_sigma=0.5, max_sigma=8.0, num_scales=15, threshold=0.05):
     """
     Generate pseudo-labels using blob detection with optimized parameters.
-    
-    Improved Scale-Space Blob Detection:
-    - min_sigma=0.5, max_sigma=8.0: Wider sigma range to detect cells at more sizes
-    - num_scales=15: More scales for finer detection granularity
-    - threshold=0.05: Lower threshold to keep more detections
-    - k_xy=3: Smaller neighborhood for maxima detection (better than k_xy=5)
-    - intensity_percentile=45: Keep top 55% brightest regions (slightly lower to catch more cells)
-    - Fixed radius=4px: Very small radius (8px diameter) to match individual cell sizes
-    - Non-maximum suppression: Prevents nearby maxima (<8px) from creating overlapping blobs
-    
-    Args:
-        cell_images_path: Path to directory containing cell images
-        output_path: Path to save pseudo-label images
-        min_sigma: Minimum sigma for blob detection (default: 1.0)
-        max_sigma: Maximum sigma for blob detection (default: 5.0)
-        num_scales: Number of scales in scale space (default: 10)
-        threshold: Threshold for blob detection (default: 0.05)
-    
-    Returns:
-        List of paths to generated pseudo-label images
     """
     os.makedirs(output_path, exist_ok=True)
     
     cell_images = sorted(glob.glob(os.path.join(cell_images_path, '*.png')))
     pseudo_label_paths = []
-    
-    # Check if GPU will be used
-    use_gpu_for_blobs = torch.cuda.is_available() and device == 'cuda'
-    if use_gpu_for_blobs:
-        print(f"Using GPU for pseudo-label generation (faster)")
-    else:
-        print(f"Using CPU for pseudo-label generation")
     
     k = (max_sigma / min_sigma) ** (1.0 / (num_scales - 1))
     
@@ -353,110 +240,69 @@ def generate_pseudo_labels(cell_images_path, output_path, min_sigma=0.5, max_sig
         if cell_img.max() > 1:
             cell_img = cell_img / 255.0
         
-        # Use GPU if available, otherwise CPU
-        use_gpu = use_gpu_for_blobs
-        compute_device = device if use_gpu else 'cpu'
+        # Build scale space
+        scale_space = []
+        for i in range(num_scales):
+            sigma = min_sigma * (k ** i)
+            filtered = gaussian_filter(cell_img, sigma)
+            scale_space.append(filtered)
         
-        if use_gpu:
-            # GPU-optimized path
-            # Convert to tensor
-            cell_img_tensor = torch.FloatTensor(cell_img).unsqueeze(0).unsqueeze(0).to(compute_device)  # (1, 1, H, W)
-            
-            # Build scale space on GPU (can be parallelized)
-            scale_space_list = []
-            for i in range(num_scales):
-                sigma = min_sigma * (k ** i)
-                filtered = gaussian_filter_gpu(cell_img_tensor, sigma, device=compute_device)
-                scale_space_list.append(filtered.squeeze(0).squeeze(0))  # (H, W)
-            
-            # Stack scales: (H, W, S)
-            scale_space_tensor = torch.stack(scale_space_list, dim=2)  # Already on GPU
-            
-            # Find maxima on GPU
-            maxima = find_maxima_modified_gpu(scale_space_tensor, k_xy=3, k_s=1)
-            
-            # Convert back to numpy for rest of processing
-            cell_img = cell_img_tensor.squeeze().cpu().numpy()
-            
-            # Clear GPU memory
-            del cell_img_tensor, scale_space_tensor, scale_space_list
-            torch.cuda.empty_cache() if use_gpu else None
-        else:
-            # CPU path (original implementation)
-            # Build scale space
-            scale_space = []
-            for i in range(num_scales):
-                sigma = min_sigma * (k ** i)
-                filtered = gaussian_filter(cell_img, sigma)
-                scale_space.append(filtered)
-            
-            scale_space = np.stack(scale_space, axis=2)  # (H, W, S)
-            
-            # Find maxima - use smaller k_xy for better cell detection
-            # k_xy=3 gives ~40% matches vs k_xy=5 which gives ~26%
-            # k_s=1 allows maxima to be found across adjacent scales
-            maxima = find_maxima_modified(scale_space, k_xy=3, k_s=1)
+        scale_space = np.stack(scale_space, axis=2)
+        
+        # Find maxima
+        maxima = find_maxima_modified(scale_space, k_xy=3, k_s=1)
         
         # Create binary mask from maxima
         H, W = cell_img.shape
         pseudo_label = np.zeros((H, W), dtype=np.float32)
         
-        # Filter maxima by intensity - only keep bright regions (assuming cells are bright)
-        # Use 50th percentile (more conservative to reduce false positives in pseudo-labels)
-        intensity_threshold = np.percentile(cell_img, 50)  # Keep top 50% brightest regions (increased from 45)
+        # Filter maxima by intensity
+        intensity_threshold = np.percentile(cell_img, 50)
         
-        # Filter maxima by intensity first
         filtered_maxima = []
         for y, x, s in maxima:
             if 0 <= y < H and 0 <= x < W:
-                # Check if this location is bright enough (cells should be bright)
                 if cell_img[y, x] >= intensity_threshold:
                     filtered_maxima.append((y, x, s))
         
-        # Apply non-maximum suppression: if two maxima are too close, keep only the brighter one
-        # This prevents creating overlapping blobs from nearby detections
-        min_distance = 10  # Minimum distance between blob centers (increased from 8 to reduce false positives)
+        # Apply non-maximum suppression
+        min_distance = 10
         suppressed_maxima = []
         for i, (y1, x1, s1) in enumerate(filtered_maxima):
             keep = True
             for j, (y2, x2, s2) in enumerate(suppressed_maxima):
                 dist = np.sqrt((y1 - y2)**2 + (x1 - x2)**2)
                 if dist < min_distance:
-                    # Too close - keep the brighter one
+                    # keep  brighter one
                     if cell_img[y1, x1] > cell_img[y2, x2]:
-                        # Current is brighter, remove the previous one
+                        # Current  brighter remove previous
                         suppressed_maxima.pop(j)
                         break
                     else:
-                        # Previous is brighter, skip current
+                        # Previous  brighter skip current
                         keep = False
                         break
             if keep:
                 suppressed_maxima.append((y1, x1, s1))
         
-        # Use very small radius to match individual cell sizes
-        # Small radius (4px = 8px diameter) better matches actual cell dot sizes
-        # This prevents one blob from covering multiple cells
-        radius = 4  # Very small radius to match individual cell sizes
+        # Small radius
+        radius = 4
         
         for y, x, s in suppressed_maxima:
                 
                 y_min, y_max = max(0, int(y - radius)), min(H, int(y + radius + 1))
                 x_min, x_max = max(0, int(x - radius)), min(W, int(x + radius + 1))
                 
-                # Create circular blob with smooth Gaussian falloff
+                # circular blob with smooth Gaussian
                 yy, xx = np.ogrid[y_min:y_max, x_min:x_max]
                 dist_sq = (yy - y)**2 + (xx - x)**2
-                # Use radius/2 for the Gaussian falloff to create smooth edges
                 blob = np.exp(-dist_sq / (2 * (radius/2)**2))
                 pseudo_label[y_min:y_max, x_min:x_max] = np.maximum(
                     pseudo_label[y_min:y_max, x_min:x_max], blob
                 )
         
-        # Use threshold=0.05 (found through testing)
         pseudo_label = (pseudo_label > threshold).astype(np.float32)
         
-        # Save pseudo-label
         save_img(pseudo_label, pseudo_path)
         pseudo_label_paths.append(pseudo_path)
     
@@ -485,11 +331,10 @@ class CellDetectionDataset(Dataset):
             label = label / 255.0
         
         # Convert to tensors
-        img_tensor = torch.FloatTensor(img).unsqueeze(0)  # (1, H, W)
-        label_tensor = torch.FloatTensor(label).unsqueeze(0)  # (1, H, W)
+        img_tensor = torch.FloatTensor(img).unsqueeze(0)
+        label_tensor = torch.FloatTensor(label).unsqueeze(0)
         
         if self.transform:
-            # Apply same transform to both image and label
             img_tensor = self.transform(img_tensor)
             label_tensor = self.transform(label_tensor)
         
@@ -520,7 +365,7 @@ def data_loaders(train_path, val_path):
     train_pseudo_labels = []
     val_pseudo_labels = []
     
-    # Check training pseudo-labels
+    # training pseudo-labels
     all_train_exist = True
     for img_path in train_cell_images:
         img_name = os.path.basename(img_path)
@@ -536,14 +381,13 @@ def data_loaders(train_path, val_path):
         train_pseudo_labels = generate_pseudo_labels(train_cell_path, train_pseudo_path)
     else:
         print(f"Using existing training pseudo-labels ({len(train_pseudo_labels)} files)")
-        # Rebuild list to ensure correct order
         train_pseudo_labels = []
         for img_path in train_cell_images:
             img_name = os.path.basename(img_path)
             pseudo_path = os.path.join(train_pseudo_path, img_name.replace('cell', 'pseudo'))
             train_pseudo_labels.append(pseudo_path)
     
-    # Check validation pseudo-labels
+    #  validation pseudo-labels
     all_val_exist = True
     for img_path in val_cell_images:
         img_name = os.path.basename(img_path)
@@ -559,18 +403,17 @@ def data_loaders(train_path, val_path):
         val_pseudo_labels = generate_pseudo_labels(val_cell_path, val_pseudo_path)
     else:
         print(f"Using existing validation pseudo-labels ({len(val_pseudo_labels)} files)")
-        # Rebuild list to ensure correct order
         val_pseudo_labels = []
         for img_path in val_cell_images:
             img_name = os.path.basename(img_path)
             pseudo_path = os.path.join(val_pseudo_path, img_name.replace('cell', 'pseudo'))
             val_pseudo_labels.append(pseudo_path)
     
-    # Create datasets
+    #  datasets
     train_dataset = CellDetectionDataset(train_cell_images, train_pseudo_labels, transform=None)
     val_dataset = CellDetectionDataset(val_cell_images, val_pseudo_labels, transform=None)
     
-    # Create data loaders
+    #  data loaders
     trainloader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=0)
     valloader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=0)
     
@@ -593,19 +436,18 @@ def train(model, trainloader, valloader, num_epoch=20):
     # 5. Save the trained model checkpoint                                        #
     ##############################################################################
     
-    # Define loss function (Binary Cross Entropy for pixel-level classification)
+    #  loss 
     criterion = nn.BCELoss()
     
-    # Define optimizer with weight decay for regularization (reduces overfitting)
+    #  optimizer, weight decay for regularization
     optimizer = optim.Adam(model.parameters(), lr=2e-3, weight_decay=1e-4)
     
-    # Learning rate scheduler: reduce LR by 0.5 every 7 epochs
+    #  learning rate scheduler
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.5)
     
     best_val_loss = float('inf')
     
     for epoch in range(num_epoch):
-        # Training phase
         model.train()
         train_loss = 0.0
         num_batches = 0
@@ -614,14 +456,14 @@ def train(model, trainloader, valloader, num_epoch=20):
             images = images.to(device)
             labels = labels.to(device)
             
-            # Forward pass
+            #  forward 
             optimizer.zero_grad()
-            outputs = model(images)  # (batch, 1, H, W)
+            outputs = model(images)
             
-            # Calculate loss
+            #  loss
             loss = criterion(outputs, labels)
             
-            # Backward pass
+            #  backward
             loss.backward()
             optimizer.step()
             
@@ -630,7 +472,7 @@ def train(model, trainloader, valloader, num_epoch=20):
         
         avg_train_loss = train_loss / num_batches if num_batches > 0 else 0.0
         
-        # Validation phase
+        #  validation
         model.eval()
         val_loss = 0.0
         val_batches = 0
@@ -648,13 +490,13 @@ def train(model, trainloader, valloader, num_epoch=20):
         
         avg_val_loss = val_loss / val_batches if val_batches > 0 else 0.0
         
-        # Update learning rate
+        #  learning rate
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
         
         print(f"Epoch {epoch+1}/{num_epoch}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, LR: {current_lr:.6f}")
         
-        # Save best model
+        #  best model
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             model_save_path = os.path.join('DATA', 'checkpoints', 'cell_detection_model.pth')
@@ -691,17 +533,17 @@ def evaluate_only(model_path, valloader, val_folder, save_dir='pred'):
     #      - Coordinates should be integers                                      #
     ##############################################################################
     
-    from scipy.ndimage import label, center_of_mass
+    from scipy.ndimage import label
     
-    # Create output directory
+    #  output directory
     pred_dir = os.path.join(val_folder, save_dir)
     os.makedirs(pred_dir, exist_ok=True)
     
-    # Load model
+    #  model
     model = CellDetectionNetwork().to(device)
     checkpoint = torch.load(model_path, map_location=device)
     
-    # Load model checkpoint
+    #  model checkpoint
     model.load_state_dict(checkpoint['model_state_dict'])
     
     model.eval()
@@ -709,101 +551,83 @@ def evaluate_only(model_path, valloader, val_folder, save_dir='pred'):
     print(f"Loaded model from {model_path}")
     print("Running inference on validation set...")
     
-    # Get image filenames for saving
+    #  image filenames
     cells_path = os.path.join(val_folder, 'cells')
     image_files = sorted([f for f in os.listdir(cells_path) if f.endswith('.png')])
     
-    total_detections = 0
     with torch.no_grad():
         for batch_idx, (images, _) in enumerate(tqdm(valloader, desc="Evaluating")):
             images = images.to(device)
-            outputs = model(images)  # (batch, 1, H, W)
+            outputs = model(images)
             
-            # Process each image in batch
+            #  each image in batch
             for i in range(images.shape[0]):
-                # Get prediction map
+                #  prediction map
                 pred_map = outputs[i, 0].cpu().numpy()  # (H, W)
                 
-                # Debug: print prediction statistics for first image
-                if batch_idx == 0 and i == 0:
-                    print(f"\nDebug - First image prediction stats:")
-                    print(f"  Min: {pred_map.min():.4f}, Max: {pred_map.max():.4f}, Mean: {pred_map.mean():.4f}")
-                    print(f"  Pixels > 0.5: {np.sum(pred_map > 0.5)}, Pixels > 0.3: {np.sum(pred_map > 0.3)}, Pixels > 0.1: {np.sum(pred_map > 0.1)}")
-                
-                # Balanced adaptive thresholding: optimize for F1 score
-                # Strategy: Model outputs are good (max ~0.99, 17% > 0.5), use moderate thresholds
-                
-                # Check how many pixels are above 0.5 - model has good coverage
+                # Check how many pixels are above 0.5
                 pixels_above_05 = np.sum(pred_map > 0.5)
                 total_pixels = pred_map.size
                 pct_above_05 = pixels_above_05 / total_pixels
                 
                 if pred_map.max() < 0.3 or pct_above_05 < 0.005:  # Very low outputs
-                    # Model outputs are very low - use adaptive thresholding
+                    #  adaptive thresholding
                     above_mean = pred_map[pred_map > pred_map.mean()]
                     if len(above_mean) > 100:
-                        # Use 75th percentile (balanced) of values above mean
+                        #  75th percentile of values above mean
                         threshold = np.percentile(above_mean, 75)
-                        threshold = min(threshold, 0.35)  # Cap at 0.35
+                        threshold = min(threshold, 0.35)
                     else:
                         threshold = 0.25
                     threshold = max(threshold, pred_map.mean() + 0.03)
-                elif pct_above_05 < 0.10:  # Less than 10% above 0.5
-                    # Use moderate threshold - model has decent outputs
+                elif pct_above_05 < 0.10:
+                    #  moderate threshold
                     threshold = 0.38
-                elif pct_above_05 < 0.20:  # 10-20% above 0.5 (typical case)
-                    # Model has good outputs - use standard threshold
+                elif pct_above_05 < 0.20:
+                    #  standard threshold
                     threshold = 0.42
                 else:
-                    # Model has very high outputs - use higher threshold
+                    #  higher threshold
                     threshold = 0.48
-                
-                if batch_idx == 0 and i == 0:
-                    print(f"  Using improved adaptive threshold: {threshold:.4f}")
                 
                 binary_map = (pred_map > threshold).astype(np.uint8)
                 
-                # Post-processing: light morphological opening to remove tiny noise
+                # Post-processing
                 from scipy.ndimage import binary_opening
-                # Use small 3x3 kernel - only remove very small noise
+                #  small 3x3 kernel
                 kernel = np.ones((3, 3), dtype=np.uint8)
                 binary_map = binary_opening(binary_map, structure=kernel).astype(np.uint8)
-                # Don't use closing - it can merge separate cells
-                
-                # Find cell centers using connected components
                 labeled, num_features = label(binary_map)
                 
                 if num_features > 0:
-                    # Filter out very small components (likely noise)
-                    min_component_size = 4  # Balanced: catch small cells but filter tiny noise
+                    #  very small components
+                    min_component_size = 4
                     coordinates = []
-                    confidences = []  # Store confidence values for NMS
+                    confidences = []
                     
                     for comp_id in range(1, num_features + 1):
                         component_mask = (labeled == comp_id)
                         component_size = np.sum(component_mask)
                         
                         if component_size >= min_component_size:
-                            # Find local maximum in prediction map within this component
-                            # This gives us the true cell center with highest confidence
+                            #  local maximum
                             component_pred = pred_map * component_mask
                             max_idx = np.unravel_index(np.argmax(component_pred), pred_map.shape)
                             y, x = max_idx
                             confidence = component_pred[y, x]
                             
-                            # Only keep if confidence is above threshold (balanced for F1)
-                            if confidence > 0.35 and not (np.isnan(x) or np.isnan(y)):  # Balanced: 0.35
+                            #  confidence is above threshold
+                            if confidence > 0.35 and not (np.isnan(x) or np.isnan(y)):
                                 coordinates.append((int(round(x)), int(round(y))))
                                 confidences.append(confidence)
                     
-                    # Non-maximum suppression: remove detections that are too close
-                    # Keep only the detection with highest confidence if within min_distance
+                    # Non-maximum suppression
                     if len(coordinates) > 1:
-                        min_distance = 12  # Balanced: 12px allows close cells but prevents duplicates
+                        min_distance = 12
                         suppressed_coords = []
                         suppressed_confs = []
                         
-                        # Sort by confidence (highest first)
+                        #  confidence (highest first)
                         sorted_indices = np.argsort(confidences)[::-1]
                         
                         for idx in sorted_indices:
@@ -811,11 +635,11 @@ def evaluate_only(model_path, valloader, val_folder, save_dir='pred'):
                             conf = confidences[idx]
                             keep = True
                             
-                            # Check distance to already kept detections
+                            #  distance to already kept detections
                             for kept_x, kept_y in suppressed_coords:
                                 dist = np.sqrt((x - kept_x)**2 + (y - kept_y)**2)
                                 if dist < min_distance:
-                                    # Too close to an existing detection, skip
+                                    #  close to an existing detection, skip
                                     keep = False
                                     break
                             
@@ -824,12 +648,10 @@ def evaluate_only(model_path, valloader, val_folder, save_dir='pred'):
                                 suppressed_confs.append(conf)
                         
                         coordinates = suppressed_coords
-                    
-                    total_detections += len(coordinates)
                 else:
                     coordinates = []
                 
-                # Save coordinates to text file
+                # Save coordinates
                 img_idx = batch_idx * valloader.batch_size + i
                 if img_idx < len(image_files):
                     img_name = image_files[img_idx]
@@ -839,8 +661,6 @@ def evaluate_only(model_path, valloader, val_folder, save_dir='pred'):
                     with open(txt_path, 'w') as f:
                         for x, y in coordinates:
                             f.write(f"{x} {y}\n")
-    
-    print(f"\nTotal detections across all images: {total_detections}")
     
     print(f"Saved predictions to {pred_dir}")
 

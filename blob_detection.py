@@ -19,21 +19,17 @@ def gaussian_filter(image, sigma):
       Gaussian filtered image of size HxW
     """
     H, W = image.shape
-    # -- good heuristic way of setting kernel size
     kernel_size = int(2 * np.ceil(2 * sigma) + 1)
-    # Ensure that the kernel size isn't too big and is odd
     kernel_size = min(kernel_size, min(H, W) // 2)
     if kernel_size % 2 == 0:
         kernel_size = kernel_size + 1
     
-    # Implement gaussian filtering of size kernel_size x kernel_size
-    # Similar to Corner detection, use scipy's convolution function.
-    # Again, be consistent with the settings (mode = 'reflect').
+    #  gaussian filtering   kernel_size x kernel_size 
     r = (kernel_size - 1) // 2
     ax = np.arange(-r, r + 1, dtype=np.float32)
     X, Y = np.meshgrid(ax, ax)
     
-    # 2D Gaussian, then normalize to sum=1
+    # 2D Gaussian + normalize to sum=1
     G = np.exp(-(X**2 + Y**2) / (2.0 * float(sigma)**2))
     G /= G.sum()
     
