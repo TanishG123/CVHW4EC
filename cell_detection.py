@@ -51,6 +51,90 @@ from torchsummary import summary
 from blob_detection import gaussian_filter, find_maxima_modified
 from common import read_img, visualize_maxima, save_img
 
+# GPU-optimized blob detection functions
+def gaussian_filter_gpu(image_tensor, sigma, device='cpu'):
+    """
+    GPU-optimized Gaussian filter using PyTorch
+    
+    Args:
+        image_tensor: PyTorch tensor of shape (1, 1, H, W)
+        sigma: scalar standard deviation
+        device: 'cuda' or 'cpu'
+    
+    Returns:
+        Filtered image tensor of shape (1, 1, H, W)
+    """
+    H, W = image_tensor.shape[2], image_tensor.shape[3]
+    kernel_size = int(2 * np.ceil(2 * sigma) + 1)
+    kernel_size = min(kernel_size, min(H, W) // 2)
+    if kernel_size % 2 == 0:
+        kernel_size = kernel_size + 1
+    
+    r = (kernel_size - 1) // 2
+    ax = torch.arange(-r, r + 1, dtype=torch.float32, device=device)
+    X, Y = torch.meshgrid(ax, ax, indexing='ij')
+    
+    # 2D Gaussian kernel
+    G = torch.exp(-(X**2 + Y**2) / (2.0 * sigma**2))
+    G = G / G.sum()
+    G = G.view(1, 1, kernel_size, kernel_size)
+    
+    # Apply convolution with reflection padding
+    padding = r
+    output = F.conv2d(image_tensor, G, padding=padding, padding_mode='reflect')
+    return output
+
+def find_maxima_modified_gpu(scale_space_tensor, k_xy=5, k_s=1):
+    """
+    GPU-optimized maxima finding using PyTorch
+    Matches the logic of find_maxima_modified but uses GPU operations
+    
+    Args:
+        scale_space_tensor: PyTorch tensor of shape (H, W, S)
+        k_xy: neighborhood in x and y
+        k_s: neighborhood in scale
+    
+    Returns:
+        list of (y, x, s) tuples
+    """
+    H, W, S = scale_space_tensor.shape
+    maxima = []
+    
+    # Reshape to (1, S, H, W) for easier processing
+    scale_space_4d = scale_space_tensor.permute(2, 0, 1).unsqueeze(0)  # (1, S, H, W)
+    
+    kernel_size = 2 * k_xy + 1
+    
+    for s in range(S):
+        # Get single scale: (1, 1, H, W)
+        scale_slice = scale_space_4d[:, s:s+1, :, :]
+        
+        # Use max pooling to find local maxima in spatial neighborhood
+        # This finds the max value in (2k_xy+1) x (2k_xy+1) neighborhood
+        max_pooled = F.max_pool2d(scale_slice, kernel_size=kernel_size, stride=1, padding=k_xy)
+        
+        # A pixel is a local maximum if it equals the max in its neighborhood
+        # AND we need to check scale dimension too
+        is_spatial_max = (scale_slice == max_pooled) & (scale_slice > 0)
+        
+        # Get coordinates of spatial maxima
+        y_coords, x_coords = torch.where(is_spatial_max[0, 0])
+        
+        for y_idx, x_idx in zip(y_coords.cpu().numpy(), x_coords.cpu().numpy()):
+            y, x = int(y_idx), int(x_idx)
+            
+            # Check scale dimension: must be max in scale neighborhood too
+            s_min = max(0, s - k_s)
+            s_max = min(S, s + k_s + 1)
+            scale_neighbors = scale_space_tensor[y, x, s_min:s_max]
+            mid_value = scale_space_tensor[y, x, s]
+            
+            # Check if mid_value is max among scale neighbors
+            if torch.all(mid_value >= scale_neighbors) and mid_value > 0:
+                maxima.append((y, x, s))
+    
+    return maxima
+
 if torch.cuda.is_available():
     print("Using the GPU. You are good to go!")
     device = 'cuda'
@@ -243,6 +327,13 @@ def generate_pseudo_labels(cell_images_path, output_path, min_sigma=0.5, max_sig
     cell_images = sorted(glob.glob(os.path.join(cell_images_path, '*.png')))
     pseudo_label_paths = []
     
+    # Check if GPU will be used
+    use_gpu_for_blobs = torch.cuda.is_available() and device == 'cuda'
+    if use_gpu_for_blobs:
+        print(f"Using GPU for pseudo-label generation (faster)")
+    else:
+        print(f"Using CPU for pseudo-label generation")
+    
     k = (max_sigma / min_sigma) ** (1.0 / (num_scales - 1))
     
     for cell_img_path in tqdm(cell_images, desc="Generating pseudo-labels"):
@@ -262,19 +353,49 @@ def generate_pseudo_labels(cell_images_path, output_path, min_sigma=0.5, max_sig
         if cell_img.max() > 1:
             cell_img = cell_img / 255.0
         
-        # Build scale space
-        scale_space = []
-        for i in range(num_scales):
-            sigma = min_sigma * (k ** i)
-            filtered = gaussian_filter(cell_img, sigma)
-            scale_space.append(filtered)
+        # Use GPU if available, otherwise CPU
+        use_gpu = use_gpu_for_blobs
+        compute_device = device if use_gpu else 'cpu'
         
-        scale_space = np.stack(scale_space, axis=2)  # (H, W, S)
-        
-        # Find maxima - use smaller k_xy for better cell detection
-        # k_xy=3 gives ~40% matches vs k_xy=5 which gives ~26%
-        # k_s=1 allows maxima to be found across adjacent scales
-        maxima = find_maxima_modified(scale_space, k_xy=3, k_s=1)
+        if use_gpu:
+            # GPU-optimized path
+            # Convert to tensor
+            cell_img_tensor = torch.FloatTensor(cell_img).unsqueeze(0).unsqueeze(0).to(compute_device)  # (1, 1, H, W)
+            
+            # Build scale space on GPU (can be parallelized)
+            scale_space_list = []
+            for i in range(num_scales):
+                sigma = min_sigma * (k ** i)
+                filtered = gaussian_filter_gpu(cell_img_tensor, sigma, device=compute_device)
+                scale_space_list.append(filtered.squeeze(0).squeeze(0))  # (H, W)
+            
+            # Stack scales: (H, W, S)
+            scale_space_tensor = torch.stack(scale_space_list, dim=2)  # Already on GPU
+            
+            # Find maxima on GPU
+            maxima = find_maxima_modified_gpu(scale_space_tensor, k_xy=3, k_s=1)
+            
+            # Convert back to numpy for rest of processing
+            cell_img = cell_img_tensor.squeeze().cpu().numpy()
+            
+            # Clear GPU memory
+            del cell_img_tensor, scale_space_tensor, scale_space_list
+            torch.cuda.empty_cache() if use_gpu else None
+        else:
+            # CPU path (original implementation)
+            # Build scale space
+            scale_space = []
+            for i in range(num_scales):
+                sigma = min_sigma * (k ** i)
+                filtered = gaussian_filter(cell_img, sigma)
+                scale_space.append(filtered)
+            
+            scale_space = np.stack(scale_space, axis=2)  # (H, W, S)
+            
+            # Find maxima - use smaller k_xy for better cell detection
+            # k_xy=3 gives ~40% matches vs k_xy=5 which gives ~26%
+            # k_s=1 allows maxima to be found across adjacent scales
+            maxima = find_maxima_modified(scale_space, k_xy=3, k_s=1)
         
         # Create binary mask from maxima
         H, W = cell_img.shape
